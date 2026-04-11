@@ -47,7 +47,7 @@
 static char  *tape, *tapestart, *tapeguardpages[2];
 static size_t realtapesize;
 
-typedef enum { OP_MOVE, OP_ADD, OP_OUTPUT, OP_INPUT, OP_JUMP_RIGHT, OP_JUMP_LEFT, OP_CLEAR, OP_ADD_TO, OP_MOVE_UNTIL } Opcode;
+typedef enum { OP_MOVE, OP_ADD, OP_OUTPUT, OP_INPUT, OP_JUMP_RIGHT, OP_JUMP_LEFT, OP_SET, OP_ADD_TO, OP_MOVE_UNTIL } Opcode;
 
 static const char *const nops[] = {
 	"\x90",                                    // nop
@@ -65,6 +65,7 @@ static const char *const nops[] = {
 typedef struct {
 	Opcode op;
 	int    arg;
+	int    off;
 } Instr;
 
 static inline size_t
@@ -227,7 +228,9 @@ main(int argc, char *argv[])
 	cvector_reserve(instrs, (size_t)st.st_size);
 
 	for (char *s = txt; likely(*s); s++) {
-		Instr instr;
+		static int offset     = 0;
+		static int loop_depth = 0;
+		Instr      instr;
 		switch (*s) {
 		case '>':
 		case '<': {
@@ -239,8 +242,11 @@ main(int argc, char *argv[])
 					n--;
 
 			if likely (n != 0) {
-				instr = (Instr){ OP_MOVE, n };
+				instr = (Instr){ OP_MOVE, n, 0 };
 				cvector_push_back(instrs, instr);
+
+				if (loop_depth == 0)
+					offset += n;
 			}
 
 			break;
@@ -255,31 +261,42 @@ main(int argc, char *argv[])
 					n--;
 
 			if likely (n != 0) {
-				instr = (Instr){ OP_ADD, n };
-				cvector_push_back(instrs, instr);
+				Instr *last = cvector_end(instrs);
+
+				if (last && last->op == OP_SET) {
+					last->arg += n;
+				} else {
+					instr = (Instr){ OP_ADD, n, offset };
+					cvector_push_back(instrs, instr);
+				}
 			}
 
 			break;
 		}
 		case '.':
-			instr.op = OP_OUTPUT;
+			instr.op  = OP_OUTPUT;
+			instr.off = offset;
 			cvector_push_back(instrs, instr);
 			break;
 		case ',':
-			instr.op = OP_INPUT;
+			instr.op  = OP_INPUT;
+			instr.off = offset;
 			cvector_push_back(instrs, instr);
 			break;
 		case '[':
-			instr.op = OP_JUMP_RIGHT;
+			loop_depth += 1;
+			instr.op  = OP_JUMP_RIGHT;
+			instr.off = offset;
 			cvector_push_back(instrs, instr);
 			break;
 		case ']': {
+			loop_depth -= 1;
 			size_t len = cvector_size(instrs);
 
 			// [-] or [+]
 			if (len >= 2 && instrs[len - 1].op == OP_ADD && instrs[len - 1].arg & 1 && instrs[len - 2].op == OP_JUMP_RIGHT) {
 				cvector_set_size(instrs, len - 2);
-				instr.op = OP_CLEAR;
+				instr = (Instr){ OP_SET, 0, offset };
 				cvector_push_back(instrs, instr);
 				break;
 			}
@@ -289,7 +306,9 @@ main(int argc, char *argv[])
 			    instrs[len - 3].op == OP_MOVE && instrs[len - 4].op == OP_ADD && instrs[len - 4].arg == -1 &&
 			    instrs[len - 1].arg == -instrs[len - 3].arg && instrs[len - 5].op == OP_JUMP_RIGHT) {
 				cvector_set_size(instrs, len - 5);
-				instr = (Instr){ OP_ADD_TO, instrs[len - 3].arg };
+				instr = (Instr){ OP_ADD_TO, instrs[len - 3].arg, offset };
+				cvector_push_back(instrs, instr);
+				instr = (Instr){ OP_SET, 0, offset };
 				cvector_push_back(instrs, instr);
 				break;
 			}
@@ -297,12 +316,13 @@ main(int argc, char *argv[])
 			// [>] or [<]
 			if (len >= 2 && instrs[len - 1].op == OP_MOVE && instrs[len - 2].op == OP_JUMP_RIGHT) {
 				cvector_set_size(instrs, len - 2);
-				instr = (Instr){ OP_MOVE_UNTIL, instrs[len - 1].arg };
+				instr = (Instr){ OP_MOVE_UNTIL, instrs[len - 1].arg, offset };
 				cvector_push_back(instrs, instr);
 				break;
 			}
 
-			instr.op = OP_JUMP_LEFT;
+			instr.op  = OP_JUMP_LEFT;
+			instr.off = offset;
 			cvector_push_back(instrs, instr);
 			break;
 		}
@@ -366,81 +386,97 @@ main(int argc, char *argv[])
 	size_t icacheline                          = sysconf(_SC_LEVEL1_ICACHE_LINESIZE);
 	code_align(icacheline);
 
+#define insert_modrf(op_, rf_)                                                      \
+	do {                                                                            \
+		if (instr.off == 0) {                                                       \
+			cvector_push_back(code, ((op_) << 3) + (rf_));                          \
+		} else if (instr.off >= CHAR_MIN && instr.off <= CHAR_MAX) {                \
+			code_append(((char[]){ '\x40' + ((op_) << 3) + (rf_), instr.off, 0 })); \
+		} else if (instr.off >= INT_MIN && instr.off <= INT_MAX) {                  \
+			code_append(((char[]){ '\x80' + ((op_) << 3) + (rf_),                   \
+			                       instr.off & 0xff,                                \
+			                       (instr.off >> 8) & 0xff,                         \
+			                       (instr.off >> 16) & 0xff,                        \
+			                       (instr.off >> 24) & 0xff,                        \
+			                       0 }));                                           \
+		}                                                                           \
+                                                                                    \
+	} while (0)
 	for (size_t i = 0; likely(i < cvector_size(instrs)); i++) {
 		Instr instr = instrs[i];
 
 		switch (instr.op) {
 		case OP_MOVE:
-			if (instr.arg == 1)
-				code_append("\x48\xff\xc3"); // inc rbx
-			else if (instr.arg == -1)
-				code_append("\x48\xff\xcb"); // dec rbx
-			else if (instr.arg > 0) {
-				unsigned int n = instr.arg;
+			if (cvector_size(jmps) > 0) {
+				if (instr.arg == 1)
+					code_append("\x48\xff\xc3"); // inc rbx
+				else if (instr.arg == -1)
+					code_append("\x48\xff\xcb"); // dec rbx
+				else if (instr.arg > 0) {
+					unsigned int n = instr.arg;
 
-				if likely (n <= UCHAR_MAX) {
-					code_append("\x48\x83\xc3\x00"); // add rbx, imm8
-					code[cvector_size(code) - 1] = n;
-				} else {
-					code_append("\x48\x81\xc3\x00\x00\x00\x00"); // add rbx, imm32
-					*(unsigned int *)(code + cvector_size(code) - 4) = n;
-				}
-			} else if (instr.arg < 0) {
-				unsigned int n = -instr.arg;
+					if likely (n <= UCHAR_MAX) {
+						code_append("\x48\x83\xc3\x00"); // add rbx, imm8
+						code[cvector_size(code) - 1] = n;
+					} else {
+						code_append("\x48\x81\xc3\x00\x00\x00\x00"); // add rbx, imm32
+						*(unsigned int *)(code + cvector_size(code) - 4) = n;
+					}
+				} else if (instr.arg < 0) {
+					unsigned int n = -instr.arg;
 
-				if (n <= UCHAR_MAX) {
-					code_append("\x48\x83\xeb\x00"); // sub rbx, imm8
-					code[cvector_size(code) - 1] = n;
-				} else {
-					code_append("\x48\x81\xeb\x00\x00\x00\x00"); // sub rbx, imm32
-					*(unsigned int *)(code + cvector_size(code) - 4) = n;
+					if (n <= UCHAR_MAX) {
+						code_append("\x48\x83\xeb\x00"); // sub rbx, imm8
+						code[cvector_size(code) - 1] = n;
+					} else {
+						code_append("\x48\x81\xeb\x00\x00\x00\x00"); // sub rbx, imm32
+						*(unsigned int *)(code + cvector_size(code) - 4) = n;
+					}
 				}
 			}
 			break;
 		case OP_ADD: {
 			short n = instr.arg % 256;
 
-			if (n == 1)
-				code_append("\xfe\x03"); // inc BYTE PTR [rbx]
-			else if (n == -1)
-				code_append("\xfe\x0b"); // dec BYTE PTR [rbx]
-			else if (n > 0) {
-				code_append("\x80\x03\x00"); // add BYTE PTR [rbx], imm8
-				code[cvector_size(code) - 1] = n;
-			} else if (n < 0) {
-				code_append("\x80\x2b\x00"); // sub BYTE PTR [rbx], imm8
-				code[cvector_size(code) - 1] = -n;
+			if (n == 1 || n == -1) {
+				cvector_push_back(code, '\xfe'); // inc/dec BYTE PTR [rbx] + off8/32
+				insert_modrf(n == -1, 3);
+			} else {
+				cvector_push_back(code, '\x80'); // add BYTE PTR [rbx] + off8/32, imm8
+				insert_modrf(n < 0 ? 5 : 0, 3);
+				cvector_push_back(code, n < 0 ? -n : n);
 			}
 
 			break;
 		}
 		case OP_OUTPUT: {
-			const char snip[] = "\x48\x0f\xbe\x3b"      // movsx rdi, BYTE PTR [rbx]
-								"\xe8\x00\x00\x00\x00"; // call  rel32
+			// const char snip[] = "\x48\x0f\xbe\x3b"      // movsx rdi, BYTE PTR [rbx] + off8/32
+			// "\xe8\x00\x00\x00\x00"; // call  rel32
 
-			cvector_push_back(putcharpatches, cvector_size(code) + 5);
-			code_append(snip);
+			code_append("\x48\x0f\xbe");
+			insert_modrf(7, 3);
+
+			code_append("\xe8\x00\x00\x00\x00");
+			cvector_push_back(putcharpatches, cvector_size(code) - 4);
 			break;
 		}
 		case OP_INPUT: {
 			if (!stdin_complete) {
 				const char snip[] = "\xe8\x00\x00\x00\x00" // call rel32
-									"\x88\x03";            // mov  BYTE PTR [rbx], al
+									"\x88";                // mov  BYTE PTR [rbx] + off8/32, al
 				cvector_push_back(getcharpatches, cvector_size(code) + 1);
 				code_append(snip);
+				insert_modrf(0, 3);
 			} else {
-				const char snip[] = "\x41\x8a\07"   // mov al, BYTE PTR [r15]
-									"\x88\x03"      // mov BYTE PTR [rbx], al
-									"\x49\xff\xc7"; // inc r15
+				const char snip[] = "\x41\x8a\07" // mov al, BYTE PTR [r15]
+									"\x88";       // mov BYTE PTR [rbx] + off8/32, al
 				code_append(snip);
+				insert_modrf(0, 3);
+				code_append("\x49\xff\xc7"); // inc r15
 			}
 			break;
 		}
 		case OP_JUMP_RIGHT: {
-			const char snip[] = "\x80\x3b\x00"      // cmp BYTE PTR [rbx], 0
-								"\x0f\x84"          // jz rel32
-								"\x0f\x1f\x40\x00"; // nop DWORD PTR [eax+0x0]
-
 			size_t cost         = 0;
 			size_t jmpstraverse = cvector_size(jmps) + 1;
 			for (size_t j = i; jmpstraverse && likely(j < cvector_size(instrs)); j++)
@@ -454,18 +490,26 @@ main(int argc, char *argv[])
 					cost += 8;
 					jmpstraverse--;
 					break;
-				case OP_CLEAR: cost += 2; break;
+				case OP_SET: cost += 2; break;
 				case OP_ADD_TO: cost += 10; break;
 				case OP_MOVE_UNTIL: cost += 10; break;
 				}
 
+			const char snip[] = "\x0f\x84"          // jz rel32
+								"\x0f\x1f\x40\x00"; // nop DWORD PTR [eax+0x0]
+
 			code_align(icacheline >> ((cvector_size(jmps) + 1) * cost / 50));
+			cvector_push_back(code, '\x80'); // cmp BYTE PTR [rbx] + off8/32, 0
+			insert_modrf(7, 3);
+			cvector_push_back(code, 0);
 			code_append(snip);
 			cvector_push_back(jmps, cvector_size(code));
 			break;
 		}
 		case OP_JUMP_LEFT: {
-			code_append("\x80\x3b\x00"); // cmp BYTE PTR [rbx], 0
+			cvector_push_back(code, '\x80'); // cmp BYTE PTR [rbx] + off8/32, 0
+			insert_modrf(7, 3);
+			cvector_push_back(code, 0);
 
 			if unlikely (cvector_size(jmps) == 0)
 				die("mismatched ]");
@@ -498,82 +542,93 @@ main(int argc, char *argv[])
 
 			break;
 		}
-		case OP_CLEAR:
-			code_append("\xc6\x03\x00"); // mov BYTE PTR [rbx], 0
-			break;
-		case OP_ADD_TO: {
-			if likely (instr.arg >= CHAR_MIN && instr.arg <= CHAR_MAX) {
-				const char snip[] = "\x8a\x03"      // mov al, BYTE PTR [rbx]
-									"\x00\x43\x00"  // add BYTE PTR [rbx + disp8], al
-									"\xc6\x03\x00"; // mov BYTE PTR [rbx], 0
-
-				code_append(snip);
-				code[cvector_size(code) - 4] = instr.arg;
+		case OP_SET: {
+			char bin_instr = '\xc6'; // mov BYTE PTR [rbx] + off8/32, n
+			char imm_size  = 1;
+			if (instr.arg >= CHAR_MIN && instr.arg <= CHAR_MAX) {
+			} else if (instr.arg >= SHRT_MIN && instr.arg <= SHRT_MAX) {
+				bin_instr = '\xc7';
+				imm_size  = 2;
 			} else {
-				const char snip[] = "\x8a\x03"                 // mov al, BYTE PTR [rbx]
-									"\x00\x83\x00\x00\x00\x00" // add BYTE PTR [rbx + disp32], al
-									"\xc6\x03\x00";            // mov BYTE PTR [rbx], 0
-
-				code_append(snip);
-				*(int *)(code + cvector_size(code) - 7) = instr.arg;
+				bin_instr = '\xc7';
+				imm_size  = 4;
 			}
+			cvector_push_back(code, bin_instr);
+			insert_modrf(0, 3);
+			for (char i = imm_size; i--;)
+				cvector_push_back(code, '\x00');
+			code[cvector_size(code) - imm_size] = imm_size == 1 ? (char)instr.arg : imm_size == 2 ? (short)instr.arg : instr.arg;
+			break;
+		}
+		case OP_ADD_TO: {
+			// if likely (instr.arg + instr.off >= CHAR_MIN && instr.arg + instr.off <= CHAR_MAX) {
+			// 	const char snip[] = "\x8a\x03"      // mov al, BYTE PTR [rbx]
+			// 						"\x00\x43\x00"  // add BYTE PTR [rbx + disp8], al
+			// 						"\xc6\x03\x00"; // mov BYTE PTR [rbx], 0
+
+			// 	code_append(snip);
+			// 	code[cvector_size(code) - 4] = instr.arg;
+			// } else {
+			// 	const char snip[] = "\x8a\x03"                 // mov al, BYTE PTR [rbx]
+			// 						"\x00\x83\x00\x00\x00\x00" // add BYTE PTR [rbx + disp32], al
+			// 						"\xc6\x03\x00";            // mov BYTE PTR [rbx], 0
+
+			// 	code_append(snip);
+			// 	*(int *)(code + cvector_size(code) - 7) = instr.arg;
+			// }
+			cvector_push_back(code, '\x8a'); // mov al, BYTE PTR [rbx] + off8/32
+			insert_modrf(0, 3);
+			cvector_push_back(code, '\x00'); // add BYTE_PTR [rbx] + off8/32
+			insert_modrf(0, 3);
 			break;
 		}
 		case OP_MOVE_UNTIL:
-			if (instr.arg == 1) {
-				const char snip[] = "\x80\x3b\x00" // cmp BYTE PTR [rbx], 0
-									"\x74\x05"     // je   5
-									"\x48\xff\xc3" // inc rbx
-									"\xeb\xf6";    // jmp -10
+			if (instr.arg == 1 || instr.arg == -1) {
+				// const char snip[] = "\x80\x3b\x00" // cmp BYTE PTR [rbx], 0
+				// 					"\x74\x05"     // je   5
+				// 					"\x48\xff\xc3" // inc rbx
+				// 					"\xeb\xf6";    // jmp -10
 
-				code_append(snip);
-			} else if (instr.arg == -1) {
-				const char snip[] = "\x80\x3b\x00" // cmp BYTE PTR [rbx], 0
-									"\x74\x05"     // je  +5
-									"\x48\xff\xcb" // dec rbx
-									"\xeb\xf6";    // jmp -10
+				// code_append(snip);
+				uintptr_t start = cvector_size(code);
+				cvector_push_back(code, '\x80');
+				insert_modrf(7, 3);
+				code_append("\x74\x05"
+				            "\x48\xff");
+				cvector_push_back(code, instr.arg == 1 ? '\xc3' : '\xcb');
+				code_append("\xeb\x00"); // jump back insert
+				code[cvector_size(code) - 1] = cvector_size(code) - start;
+			} else if (instr.arg > 1 || instr.arg < -1) {
+				bool         neg   = instr.arg < -1;
+				unsigned int n     = instr.arg * -neg;
+				uintptr_t    start = cvector_size(code);
 
-				code_append(snip);
-			} else if (instr.arg > 1) {
-				unsigned int n = instr.arg;
-
+				cvector_push_back(code, '\x80');
+				insert_modrf(7, 3);
+				code_append("\x00"
+				            "\x74\x06"
+				            "\x48");
 				if likely (n <= UCHAR_MAX) {
-					const char snip[] = "\x80\x3b\x00"     // cmp BYTE PTR [rbx], 0
-										"\x74\x06"         // je  +6
-										"\x48\x83\xc3\x00" // add rbx, imm8
-										"\xeb\xf5";        // jmp -11
+					// const char snip[] = "\x80\x3b\x00"     // cmp BYTE PTR [rbx], 0
+					// 					"\x74\x06"         // je  +6
+					// 					"\x48\x83\xc3\x00" // add rbx, imm8
+					// 					"\xeb\xf5";        // jmp -11
 
-					code_append(snip);
-					code[cvector_size(code) - 3] = n;
+					// code_append(snip);
+
+					code_append(((char[]){ '\x83', neg ? '\xeb' : '\xc3', n, '\xeb', 0 })); // jump back insert
+																							// code[cvector_size(code) - 3] = n;
 				} else {
-					const char snip[] = "\x80\x3b\x00"                 // cmp BYTE PTR [rbx], 0
-										"\x74\x09"                     // je  +9
-										"\x48\x81\xc3\x00\x00\x00\x00" // add rbx, imm32
-										"\xeb\xf2";                    // jmp -14
+					// const char snip[] = "\x80\x3b\x00"                 // cmp BYTE PTR [rbx], 0
+					// 					"\x74\x09"                     // je  +9
+					// 					"\x48\x81\xc3\x00\x00\x00\x00" // add rbx, imm32
+					// 					"\xeb\xf2";                    // jmp -14
 
-					code_append(snip);
+					// code_append(snip);
+					code_append(((char[]){ '\x81', neg ? '\xeb' : '\xc3', 0, 0, 0, 0, '\xeb', 0 })); // jump back insert
 					*(unsigned int *)(code + cvector_size(code) - 6) = n;
 				}
-			} else if (instr.arg < -1) {
-				unsigned int n = -instr.arg;
-
-				if likely (n <= UCHAR_MAX) {
-					const char snip[] = "\x80\x3b\x00"     // cmp BYTE PTR [rbx], 0
-										"\x74\x06"         // je  +6
-										"\x48\x83\xeb\x00" // sub rbx, imm8
-										"\xeb\xf5";        // jmp -11
-
-					code_append(snip);
-					code[cvector_size(code) - 3] = n;
-				} else {
-					const char snip[] = "\x80\x3b\x00"                 // cmp BYTE PTR [rbx], 0
-										"\x74\x09"                     // je  +9
-										"\x48\x81\xeb\x00\x00\x00\x00" // sub rbx, imm32
-										"\xeb\xf2";                    // jmp -14
-
-					code_append(snip);
-					*(unsigned int *)(code + cvector_size(code) - 6) = n;
-				}
+				code[cvector_size(code) - 1] = (char)(start - cvector_size(code));
 			}
 			break;
 		}
